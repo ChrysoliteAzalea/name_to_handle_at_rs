@@ -1,0 +1,17 @@
+[package]
+name = "name_to_handle_at_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2.6.0"
+
+[build-dependencies]
+bindgen = "0.70.1"
+
+[dev-dependencies]
+libc = "0.2.158"
+
+[[test]]
+name = "test"
+path = "test/test.rs"
