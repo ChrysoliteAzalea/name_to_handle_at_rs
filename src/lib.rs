@@ -16,12 +16,13 @@ use std::convert::TryFrom;
 use bitflags::bitflags;
 mod ffi_bindings;
 use crate::ffi_bindings::*;
+use std::collections::TryReserveError;
 
 /// A struct representing the file handle. The file handle itself is stored on the heap, this struct only contains a pointer to it.
 #[derive(Clone)]
 pub struct LinuxFileHandle
 {
-   v: Vec<u8>,
+   v: Vec<u32>,
    mnt_id: i32,
 }
 
@@ -64,11 +65,48 @@ impl LinuxFileHandle
    /// Access the bytes of file handle itself, for example, to send it to the client or save to disk
    ///
    /// The file handle should be considered an opaque value
-   pub fn get_slice(&self) -> &[u8]
+   pub fn get_slice(&self) -> &[u32]
    {
       self.v.as_slice()
    }
+   
+   /// Access the bytes of file handle itself, for example, to send it to the client or save to disk
+   ///
+   /// The file handle should be considered an opaque value
+   pub fn get_vec(&self) -> Result<Vec<u8>,TryReserveError>
+   {
+      let mut result = Vec::<u8>::new();
+      result.try_reserve(self.v.len() * 4)?;
+      for i in &self.v
+      {
+         for j in i.to_ne_bytes()
+         {
+            result.push(j);
+         }
+      }
+      Ok(result)
+   }
+   
+   /// Construct a file handle from bytes
+   pub fn from_vec(src: &[u8]) -> Result<LinuxFileHandle,TryReserveError>
+   {
+      let mut result = Vec::<u32>::new();
+      result.try_reserve(Self::get_aligned_fh_size(src.len()))?;
+      for i in src.chunks(4)
+      {
+         let mut arr: [u8; 4] = [0; 4];
+         let mut count: usize = 0;
+         for j in i.iter().take(4)
+         {
+            arr[count] = *j;
+            count += 1;
+         }
+         result.push(u32::from_ne_bytes(arr));
+      }
+      Ok(LinuxFileHandle { v : result, mnt_id: -1 })
+   }
 
+   #[inline(always)]
    fn get_signed(s: u32) -> std::io::Result<i32>
    {
       match s.try_into()
@@ -78,6 +116,15 @@ impl LinuxFileHandle
       }
    }
    
+   #[inline(always)]
+   fn get_aligned_fh_size(s: usize) -> usize
+   {
+      let align = 4 - (s % 4);
+      let aligned_size = s + align;
+      aligned_size/4
+   }
+   
+   #[inline(always)]
    fn get_usize(s: u32) -> std::io::Result<usize>
    {
       match s.try_into()
@@ -87,20 +134,23 @@ impl LinuxFileHandle
       }
    }
 
+   #[inline(always)]
+   #[allow(unused_assignments)]
    fn obtain_impl(dirfd: Option<BorrowedFd<'_>>, path: &str, flags: std::os::raw::c_int) -> std::io::Result<LinuxFileHandle>
    {
+      let mut fdclone: Option<OwnedFd> = None;
       let d_fd = match dirfd
       {
          Some(fd) => {
-            let t = fd.try_clone_to_owned()?;
-            t.as_raw_fd()
+            fdclone = Some(fd.try_clone_to_owned()?);
+            fdclone.as_ref().unwrap().as_raw_fd()
          },
          None => AT_FDCWD,
       };
       let mut mnt_id: i32 = 0;
-      let mut fh = Vec::<u8>::new();
-      fh.try_reserve(8)?;
-      fh.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+      let mut fh = Vec::<u32>::new();
+      fh.try_reserve(2)?;
+      fh.extend_from_slice(&[0, 0]);
       let mut path_v = Vec::<u8>::new();
       path_v.try_reserve(path.len() + 1)?;
       path_v.extend_from_slice(path.as_bytes());
@@ -115,9 +165,9 @@ impl LinuxFileHandle
       {
          return Err(first_err); // something very unexpected
       }
-      let handle_bytes: [u8; 4] = [fh[0], fh[1], fh[2], fh[3]];
-      let fh_size = u32::from_ne_bytes(handle_bytes);
-      fh.try_reserve(Self::get_usize(fh_size)?)?;
+      //let handle_bytes: [u8; 4] = [fh[0], fh[1], fh[2], fh[3]];
+      let fh_size = fh[0]; // u32::from_ne_bytes(handle_bytes);
+      fh.try_reserve(Self::get_aligned_fh_size(Self::get_usize(fh_size)?))?;
       while fh.len() < fh.capacity()
       {
          fh.push(0);
@@ -152,7 +202,7 @@ impl LinuxFileHandle
    pub unsafe fn open_by_handle(&self, mnt_fd: BorrowedFd<'_>, flags: OpenFlags) -> std::io::Result<OwnedFd>
    {
       let f = flags.bits();
-      let mut v_dup = Vec::<u8>::new();
+      let mut v_dup = Vec::<u32>::new();
       v_dup.try_reserve(self.v.len())?;
       v_dup.extend_from_slice(&self.v);
       let r = unsafe { open_by_handle_at(mnt_fd.try_clone_to_owned()?.as_raw_fd(), v_dup.as_mut_ptr() as *mut file_handle, Self::get_signed(f)?) };
@@ -169,21 +219,21 @@ impl LinuxFileHandle
    /// Similar to ```clone()```, but uses fallible memory allocation API
    pub fn duplicate(&self) -> Result<LinuxFileHandle,std::collections::TryReserveError>
    {
-      let mut v_dup = Vec::<u8>::new();
+      let mut v_dup = Vec::<u32>::new();
       v_dup.try_reserve(self.v.len())?;
       v_dup.extend_from_slice(&self.v);
       Ok(LinuxFileHandle { v: v_dup, mnt_id: self.mnt_id })
    }
 }
 
-impl TryFrom<&[u8]> for LinuxFileHandle
+impl TryFrom<&[u32]> for LinuxFileHandle
 {
    type Error = std::collections::TryReserveError;
    
    /// Creates a file-handle from a custom byte-array
-   fn try_from(value: &[u8]) -> Result<LinuxFileHandle,std::collections::TryReserveError>
+   fn try_from(value: &[u32]) -> Result<LinuxFileHandle,std::collections::TryReserveError>
    {
-      let mut v_dup = Vec::<u8>::new();
+      let mut v_dup = Vec::<u32>::new();
       v_dup.try_reserve(value.len())?;
       v_dup.extend_from_slice(value);
       Ok(LinuxFileHandle { v: v_dup, mnt_id: -1 })

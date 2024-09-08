@@ -17,6 +17,7 @@ mod tests {
         let fd = unsafe { fh.open_by_handle(f_obj.as_fd(), OpenFlags::O_PATH).unwrap() };
     }
     
+    #[test]
     fn fd_works() {
       // This test checks that the file descriptor opened by file handle points to the same i-node
        let fd_obj = std::fs::File::open("/bin/sh").unwrap();
