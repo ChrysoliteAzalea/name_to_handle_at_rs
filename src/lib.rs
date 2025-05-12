@@ -19,6 +19,7 @@ use crate::ffi_bindings::*;
 mod aligned_u8;
 use crate::aligned_u8::AlignedU8;
 use core::mem::MaybeUninit;
+use std::ffi::CStr;
 
 /// A struct representing the file handle. The file handle itself is stored on the heap, this struct only contains a pointer to it.
 #[derive(Clone)]
@@ -65,6 +66,9 @@ impl<'a> LinuxFileHandle
    {
       let pointer = self.v.as_ptr() as *const u8;
       let size = self.v.len();
+      // SAFETY:
+      // * both pointer and size have been received from Vec<AlignedU8>, so they can be made into a slice
+      // * the slice has the lifetime of &self
       unsafe { core::slice::from_raw_parts::<'a, u8>(pointer, size) }
    }
 }
@@ -73,6 +77,7 @@ impl<'a> LinuxFileHandle
 fn zero_spare_capacity(target: &mut Vec<AlignedU8>)
 {
    target.spare_capacity_mut().fill(MaybeUninit::zeroed());
+   // SAFETY: spare capacity has been initialized earlier in this function
    unsafe { target.set_len(target.capacity()) };
 }
 
@@ -82,6 +87,7 @@ fn expand_len(target: &mut Vec<AlignedU8>, addlen: usize)
    let oldlen = target.len();
    let cap = &mut target.spare_capacity_mut()[0..addlen];
    cap.fill(MaybeUninit::zeroed());
+   // SAFETY: the first "addlen" bytes of the spare capacity have been initialized earlier in this function
    unsafe { target.set_len(oldlen + addlen); }
 }
 
@@ -111,7 +117,7 @@ impl LinuxFileHandle
       }
    }
 
-   fn obtain_impl(dirfd: Option<BorrowedFd<'_>>, path: &str, flags: std::os::raw::c_int) -> std::io::Result<LinuxFileHandle>
+   fn obtain_impl(dirfd: Option<BorrowedFd<'_>>, path: &CStr, flags: std::os::raw::c_int) -> std::io::Result<LinuxFileHandle>
    {
       let d_fd = match dirfd
       {
@@ -125,11 +131,8 @@ impl LinuxFileHandle
       let mut fh = Vec::<AlignedU8>::new();
       fh.try_reserve(8)?;
       fh.extend_from_slice(&[AlignedU8(0); 8]);
-      let mut path_v = Vec::<u8>::new();
-      path_v.try_reserve_exact(path.len() + 1)?;
-      path_v.extend_from_slice(path.as_bytes());
-      path_v.push(0);
-      let _ = unsafe { name_to_handle_at(d_fd, path_v.as_ptr() as *const i8, fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
+      // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function
+      let _ = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
       let first_err = std::io::Error::last_os_error(); // first call to name_to_handle_at() should normally fail with EOVERFLOW, checking if it's indeed the case
       if let Some(err) = first_err.raw_os_error()
       {
@@ -142,12 +145,9 @@ impl LinuxFileHandle
       let handle_bytes: [u8; 4] = [fh[0].0, fh[1].0, fh[2].0, fh[3].0];
       let fh_size = u32::from_ne_bytes(handle_bytes);
       fh.try_reserve_exact(Self::get_usize(fh_size)?)?;
-      /*while fh.len() < fh.capacity()
-      {
-         fh.push(AlignedU8(0));
-      } // */
       zero_spare_capacity(&mut fh);
-      let r = unsafe { name_to_handle_at(d_fd, path_v.as_ptr() as *const i8, fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
+      // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function
+      let r = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
       if r == 0
       {
          Ok(LinuxFileHandle { v: fh, mnt_id: mnt_id })
@@ -159,13 +159,16 @@ impl LinuxFileHandle
    }
    
    /// Retrieve a file handle for the given file relative to dirfd (if dirfd is None, then the current directory is used)```
-   pub fn obtain(dirfd: Option<BorrowedFd<'_>>, path: &str) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(dirfd, path, 0) }
+   pub fn obtain(dirfd: Option<BorrowedFd<'_>>, path: &CStr) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(dirfd, path, 0) }
    
    /// Retrieve a file handle for the given file relative to dirfd (if dirfd is None, then the current directory is used), dereferencing the symbolic links```
-   pub fn obtain_follow(dirfd: Option<BorrowedFd<'_>>, path: &str) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(dirfd, path, Self::get_signed(AT_SYMLINK_FOLLOW)?) }
+   pub fn obtain_follow(dirfd: Option<BorrowedFd<'_>>, path: &CStr) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(dirfd, path, Self::get_signed(AT_SYMLINK_FOLLOW)?) }
+   
+   const EMPTY_C_STRING_STORAGE: &'static [u8] = b"\0";
+   const EMPTY_C_STRING: &'static std::ffi::CStr = unsafe { CStr::from_bytes_with_nul_unchecked(Self::EMPTY_C_STRING_STORAGE) };
    
    /// Retrieve a file handle for the file represented by a file descriptor
-   pub fn obtain_fd(fd: Option<BorrowedFd<'_>>) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(fd, "", Self::get_signed(AT_EMPTY_PATH)?) }
+   pub fn obtain_fd(fd: Option<BorrowedFd<'_>>) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(fd, Self::EMPTY_C_STRING, Self::get_signed(AT_EMPTY_PATH)?) }
    
    /// Opens a file referred to by the file handle. ```mnt_fd``` should be a file descriptor for any file on the filesystem of the target file. ```flags``` is file opening flags, similar to those in ```openat()```
    /// 
@@ -180,9 +183,11 @@ impl LinuxFileHandle
       let mut v_dup = Vec::<AlignedU8>::new();
       v_dup.try_reserve_exact(self.v.len())?;
       v_dup.extend_from_slice(&self.v);
+      // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function.
       let r = unsafe { open_by_handle_at(mnt_fd.as_raw_fd(), v_dup.as_mut_ptr() as *mut file_handle, Self::get_signed(f)?) };
       if r >= 0
       {
+         // SAFETY: We have confirmed that "r" is indeed a valid file descriptor (not -1), and we exclusively own it
          unsafe { Ok(OwnedFd::from_raw_fd(r)) }
       }
       else
@@ -207,6 +212,10 @@ fn copy_slice_to_aligned(src: &[u8], dest: &mut [AlignedU8])
    if src.len() != dest.len() { panic!("internal error: copy_slice_to_aligned() is somehow called with slices of different sizes"); }
    let srcptr = src.as_ptr();
    let destptr = dest.as_mut_ptr();
+   // SAFETY:
+   // * Pointers are obtained from valid slices
+   // * Both slices are confirmed to have equal length
+   // * Mutable slice reference for dest ensures non-overlapping
    unsafe { core::ptr::copy_nonoverlapping(srcptr, destptr as *mut u8, dest.len()) };
 }
 
