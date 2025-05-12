@@ -3,6 +3,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use name_to_handle_at_rs::LinuxFileHandle;
 use name_to_handle_at_rs::OpenFlags;
+use std::ffi::CString;
 
 #[cfg(test)]
 mod tests {
@@ -12,7 +13,8 @@ mod tests {
     fn it_works() {
       // This test will fail if CAP_DAC_READ_SEARCH is not effective for it
       // This test will also fail in unprivileged containers
-        let fh = LinuxFileHandle::obtain_follow(None, "/bin/sh").unwrap(); // trying to choose a file that exists on most systems
+        let path = CString::new("/bin/sh").unwrap();
+        let fh = LinuxFileHandle::obtain_follow(None, &path).unwrap(); // trying to choose a file that exists on most systems
         let f_obj = std::fs::File::open("/bin/sh").unwrap();
         let fd = unsafe { fh.open_by_handle(f_obj.as_fd(), OpenFlags::O_PATH).unwrap() };
     }

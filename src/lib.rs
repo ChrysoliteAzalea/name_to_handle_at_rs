@@ -165,6 +165,7 @@ impl LinuxFileHandle
    pub fn obtain_follow(dirfd: Option<BorrowedFd<'_>>, path: &CStr) -> std::io::Result<LinuxFileHandle> { Self::obtain_impl(dirfd, path, Self::get_signed(AT_SYMLINK_FOLLOW)?) }
    
    const EMPTY_C_STRING_STORAGE: &'static [u8] = b"\0";
+   // SAFETY: EMPTY_C_STRING_STORAGE is a 0-terminated constant array
    const EMPTY_C_STRING: &'static std::ffi::CStr = unsafe { CStr::from_bytes_with_nul_unchecked(Self::EMPTY_C_STRING_STORAGE) };
    
    /// Retrieve a file handle for the file represented by a file descriptor
