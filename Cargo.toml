@@ -2,6 +2,10 @@
 name = "name_to_handle_at_rs"
 version = "1.0.0"
 edition = "2021"
+license-file = "LICENSE"
+description = "Rust bindings for name_to_handle_at() and open_by_handle_at() system calls in Linux"
+repository = "https://github.com/ChrysoliteAzalea/name_to_handle_at_rs"
+readme = "README.md"
 
 [dependencies]
 bitflags = "2.6.0"
