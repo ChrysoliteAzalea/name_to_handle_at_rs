@@ -121,10 +121,7 @@ impl LinuxFileHandle
    {
       let d_fd = match dirfd
       {
-         Some(fd) => {
-            let t = fd.try_clone_to_owned()?;
-            t.as_raw_fd()
-         },
+         Some(fd) => fd.as_raw_fd(),
          None => AT_FDCWD,
       };
       let mut mnt_id: i32 = 0;

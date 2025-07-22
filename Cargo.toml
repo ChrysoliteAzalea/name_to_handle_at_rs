@@ -1,6 +1,6 @@
 [package]
 name = "name_to_handle_at_rs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license-file = "LICENSE"
 description = "Rust bindings for name_to_handle_at() and open_by_handle_at() system calls in Linux"
