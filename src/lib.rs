@@ -108,13 +108,21 @@ impl LinuxFileHandle
       }
    }
    
-   fn get_usize(s: u32) -> std::io::Result<usize>
+   fn get_usize<Num : TryInto<usize>>(s: Num) -> std::io::Result<usize>
    {
       match s.try_into()
       {
          Ok(f) => Ok(f),
          Err(_) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "conversion error")),
       }
+   }
+   
+   #[inline]
+   fn take_handle_bytes(place: &[AlignedU8]) -> std::io::Result<usize>
+   {
+      if place.len() < core::mem::size_of::<file_handle>() { return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)); }
+      let fh_ref = unsafe { &*((place.as_ptr()) as *const file_handle) };
+      Self::get_usize(fh_ref.handle_bytes)
    }
 
    fn obtain_impl(dirfd: Option<BorrowedFd<'_>>, path: &CStr, flags: std::os::raw::c_int) -> std::io::Result<LinuxFileHandle>
@@ -126,8 +134,8 @@ impl LinuxFileHandle
       };
       let mut mnt_id: i32 = 0;
       let mut fh = Vec::<AlignedU8>::new();
-      fh.try_reserve(8)?;
-      fh.extend_from_slice(&[AlignedU8(0); 8]);
+      fh.try_reserve(core::mem::size_of::<file_handle>())?;
+      fh.extend_from_slice(&[AlignedU8(0); core::mem::size_of::<file_handle>()]);
       // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function
       let _ = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
       let first_err = std::io::Error::last_os_error(); // first call to name_to_handle_at() should normally fail with EOVERFLOW, checking if it's indeed the case
@@ -139,9 +147,8 @@ impl LinuxFileHandle
       {
          return Err(first_err); // something very unexpected
       }
-      let handle_bytes: [u8; 4] = [fh[0].0, fh[1].0, fh[2].0, fh[3].0];
-      let fh_size = u32::from_ne_bytes(handle_bytes);
-      fh.try_reserve_exact(Self::get_usize(fh_size)?)?;
+      let handle_bytes = Self::take_handle_bytes(&fh)?;
+      fh.try_reserve_exact(Self::get_usize(handle_bytes)?)?;
       zero_spare_capacity(&mut fh);
       // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function
       let r = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
