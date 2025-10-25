@@ -8,7 +8,6 @@
 //!
 //! This crate can be useful for user-space NFS servers (since NFS protocols require such references) and fanotify users wanting to refer to watched files by handles
 use std::os::fd::BorrowedFd;
-use std::vec::Vec;
 use std::os::fd::OwnedFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -16,16 +15,17 @@ use std::convert::TryFrom;
 use bitflags::bitflags;
 mod ffi_bindings;
 use crate::ffi_bindings::*;
-mod aligned_u8;
-use crate::aligned_u8::AlignedU8;
-use core::mem::MaybeUninit;
 use std::ffi::CStr;
+mod allocate_aligned;
+use crate::allocate_aligned::{AlignedBuffer,AllocationError};
+use core::num::NonZero;
+use std::io::ErrorKind;
 
 /// A struct representing the file handle. The file handle itself is stored on the heap, this struct only contains a pointer to it.
 #[derive(Clone)]
 pub struct LinuxFileHandle
 {
-   v: Vec<AlignedU8>,
+   v: AlignedBuffer<core::ffi::c_int>,
    mnt_id: i32,
 }
 
@@ -64,31 +64,8 @@ impl<'a> LinuxFileHandle
    /// The file handle should be considered an opaque value
    pub fn get_slice(&'a self) -> &'a [u8]
    {
-      let pointer = self.v.as_ptr() as *const u8;
-      let size = self.v.len();
-      // SAFETY:
-      // * both pointer and size have been received from Vec<AlignedU8>, so they can be made into a slice
-      // * the slice has the lifetime of &self
-      unsafe { core::slice::from_raw_parts::<'a, u8>(pointer, size) }
+      self.v.get()
    }
-}
-   
-#[inline]
-fn zero_spare_capacity(target: &mut Vec<AlignedU8>)
-{
-   target.spare_capacity_mut().fill(MaybeUninit::zeroed());
-   // SAFETY: spare capacity has been initialized earlier in this function
-   unsafe { target.set_len(target.capacity()) };
-}
-
-#[inline]
-fn expand_len(target: &mut Vec<AlignedU8>, addlen: usize)
-{
-   let oldlen = target.len();
-   let cap = &mut target.spare_capacity_mut()[0..addlen];
-   cap.fill(MaybeUninit::zeroed());
-   // SAFETY: the first "addlen" bytes of the spare capacity have been initialized earlier in this function
-   unsafe { target.set_len(oldlen + addlen); }
 }
 
 impl LinuxFileHandle
@@ -118,7 +95,7 @@ impl LinuxFileHandle
    }
    
    #[inline]
-   fn take_handle_bytes(place: &[AlignedU8]) -> std::io::Result<usize>
+   fn take_handle_bytes(place: &[u8]) -> std::io::Result<usize>
    {
       if place.len() < core::mem::size_of::<file_handle>() { return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)); }
       let fh_ref = unsafe { &*((place.as_ptr()) as *const file_handle) };
@@ -133,11 +110,9 @@ impl LinuxFileHandle
          None => AT_FDCWD,
       };
       let mut mnt_id: i32 = 0;
-      let mut fh = Vec::<AlignedU8>::new();
-      fh.try_reserve(core::mem::size_of::<file_handle>())?;
-      fh.extend_from_slice(&[AlignedU8(0); core::mem::size_of::<file_handle>()]);
+      let mut fh: AlignedBuffer<core::ffi::c_int> = AlignedBuffer::new(NonZero::new(core::mem::size_of::<file_handle>()).ok_or(std::io::Error::from(ErrorKind::InvalidInput))?)?;
       // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function
-      let _ = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
+      let _ = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.get_mut().as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
       let first_err = std::io::Error::last_os_error(); // first call to name_to_handle_at() should normally fail with EOVERFLOW, checking if it's indeed the case
       if let Some(err) = first_err.raw_os_error()
       {
@@ -147,11 +122,14 @@ impl LinuxFileHandle
       {
          return Err(first_err); // something very unexpected
       }
-      let handle_bytes = Self::take_handle_bytes(&fh)?;
-      fh.try_reserve_exact(Self::get_usize(handle_bytes)?)?;
-      zero_spare_capacity(&mut fh);
+      let handle_bytes = Self::take_handle_bytes(fh.get())?;
+      {
+         let mut realfh: AlignedBuffer<core::ffi::c_int> = AlignedBuffer::new(NonZero::new(core::mem::size_of::<file_handle>() + Self::get_usize(handle_bytes)?).ok_or(std::io::Error::from(ErrorKind::InvalidInput))?)?;
+         (&mut realfh.get_mut()[..core::mem::size_of::<file_handle>()]).copy_from_slice(fh.get());
+         core::mem::swap(&mut realfh, &mut fh);
+      }
       // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function
-      let r = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
+      let r = unsafe { name_to_handle_at(d_fd, path.as_ptr(), fh.get_mut().as_mut_ptr() as *mut file_handle, &mut mnt_id as *mut i32, flags) };
       if r == 0
       {
          Ok(LinuxFileHandle { v: fh, mnt_id: mnt_id })
@@ -185,11 +163,10 @@ impl LinuxFileHandle
    pub unsafe fn open_by_handle(&self, mnt_fd: BorrowedFd<'_>, flags: OpenFlags) -> std::io::Result<OwnedFd>
    {
       let f = flags.bits();
-      let mut v_dup = Vec::<AlignedU8>::new();
-      v_dup.try_reserve_exact(self.v.len())?;
-      v_dup.extend_from_slice(&self.v);
+      let mut v_dup: AlignedBuffer<core::ffi::c_int> = AlignedBuffer::new(NonZero::new(self.v.get().len()).ok_or(std::io::Error::from(ErrorKind::InvalidInput))?)?;
+      v_dup.get_mut().copy_from_slice(self.v.get());
       // SAFETY: FFI function call. Validity of all arguments has been ensured earlier in this function.
-      let r = unsafe { open_by_handle_at(mnt_fd.as_raw_fd(), v_dup.as_mut_ptr() as *mut file_handle, Self::get_signed(f)?) };
+      let r = unsafe { open_by_handle_at(mnt_fd.as_raw_fd(), v_dup.get_mut().as_mut_ptr() as *mut file_handle, Self::get_signed(f)?) };
       if r >= 0
       {
          // SAFETY: We have confirmed that "r" is indeed a valid file descriptor (not -1), and we exclusively own it
@@ -202,39 +179,21 @@ impl LinuxFileHandle
    }
    
    /// Similar to ```clone()```, but uses fallible memory allocation API
-   pub fn duplicate(&self) -> Result<LinuxFileHandle,std::collections::TryReserveError>
+   pub fn duplicate(&self) -> Result<LinuxFileHandle,AllocationError>
    {
-      let mut v_dup = Vec::<AlignedU8>::new();
-      v_dup.try_reserve_exact(self.v.len())?;
-      v_dup.extend_from_slice(&self.v);
-      Ok(LinuxFileHandle { v: v_dup, mnt_id: self.mnt_id })
+      Ok(LinuxFileHandle { v: self.v.duplicate()?, mnt_id: self.mnt_id })
    }
-}
-
-#[inline]
-fn copy_slice_to_aligned(src: &[u8], dest: &mut [AlignedU8])
-{
-   if src.len() != dest.len() { panic!("internal error: copy_slice_to_aligned() is somehow called with slices of different sizes"); }
-   let srcptr = src.as_ptr();
-   let destptr = dest.as_mut_ptr();
-   // SAFETY:
-   // * Pointers are obtained from valid slices
-   // * Both slices are confirmed to have equal length
-   // * Mutable slice reference for dest ensures non-overlapping
-   unsafe { core::ptr::copy_nonoverlapping(srcptr, destptr as *mut u8, dest.len()) };
 }
 
 impl TryFrom<&[u8]> for LinuxFileHandle
 {
-   type Error = std::collections::TryReserveError;
+   type Error = AllocationError;
    
    /// Creates a file-handle from a custom byte-array
-   fn try_from(value: &[u8]) -> Result<LinuxFileHandle,std::collections::TryReserveError>
+   fn try_from(value: &[u8]) -> Result<LinuxFileHandle,AllocationError>
    {
-      let mut v_dup = Vec::<AlignedU8>::new();
-      v_dup.try_reserve_exact(value.len())?;
-      expand_len(&mut v_dup, value.len());
-      copy_slice_to_aligned(value, v_dup.as_mut_slice());
+      let mut v_dup: AlignedBuffer<core::ffi::c_int> = AlignedBuffer::new(NonZero::new(value.len()).ok_or(AllocationError)?)?;
+      v_dup.get_mut().copy_from_slice(value);
       Ok(LinuxFileHandle { v: v_dup, mnt_id: -1 })
    }
 }

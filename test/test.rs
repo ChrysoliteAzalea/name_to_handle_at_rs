@@ -4,6 +4,7 @@ use std::os::fd::AsRawFd;
 use name_to_handle_at_rs::LinuxFileHandle;
 use name_to_handle_at_rs::OpenFlags;
 use std::ffi::CString;
+use core::num::NonZero;
 
 #[cfg(test)]
 mod tests {
@@ -30,5 +31,14 @@ mod tests {
        assert_eq!(unsafe { libc::fstat(fd_obj.as_raw_fd(), original.as_mut_ptr()) }, 0);
        assert_eq!(unsafe { libc::fstat(owned_fd.as_raw_fd(), opened.as_mut_ptr()) }, 0);
        unsafe { assert_eq!(original.assume_init().st_ino, opened.assume_init().st_ino) };
-    }
+    } // */
+    
+    /*#[test]
+    fn aligned_memory()
+    {
+      // This test is commented-out, because it requires the "allocate_aligned" module to be public
+      let mut mem = name_to_handle_at_rs::allocate_aligned::AlignedBuffer::<core::ffi::c_int>::new(NonZero::new(4).unwrap()).unwrap();
+      mem.get_mut().copy_from_slice("test".as_bytes());
+      let second = mem.duplicate().unwrap();
+    } */
 }
